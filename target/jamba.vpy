@@ -21,6 +21,7 @@ from scripts import havsfunc
 from scripts import blending
 from scripts import adjust
 from scripts import filldrops
+from scripts import hudmask
 from scripts.consts import YES, NO
 
 if environ.get("SM_RECIPE") not in [None, ""]:
@@ -222,14 +223,49 @@ def resolve_mask_path(folder_path: str, file_name: str):
     return mask_path
 
 
-if (am := rc['artifact masking'])['enabled'].lower() in YES:
-    MASK_PATH = resolve_mask_path(
+def load_manual_mask(am: dict, required: bool):
+    if am['file name'].lower() in NO:
+        if required:
+            resolve_mask_path(am['folder path'], am['file name'])
+        return None
+
+    mask_path = resolve_mask_path(
         folder_path=am['folder path'],
         file_name=am['file name']
     )
-else:
-    MASK_PATH = None
-# mask path resolve
+    return core.ffms2.Source(mask_path)
+
+
+def combine_protection_masks(masks):
+    masks = [mask for mask in masks if mask is not None]
+    if not masks:
+        return None
+
+    combined = masks[0]
+    for mask in masks[1:]:
+        mask = core.std.ShufflePlanes(
+            mask,
+            planes=0,
+            colorfamily=vs.GRAY
+        )
+        mask = core.resize.Bicubic(
+            mask,
+            width=combined.width,
+            height=combined.height,
+            format=combined.format
+        )
+        if combined.num_frames == 1 and mask.num_frames > 1:
+            combined = combined[0] * mask.num_frames
+        elif mask.num_frames == 1 and combined.num_frames > 1:
+            mask = mask[0] * combined.num_frames
+        combined = core.std.Expr([combined, mask], expr="x y min")
+    return combined
+
+
+MASK_PREVIEW = False
+PROTECTION_MASK = None
+AUTOMATIC_PROTECTION_MASK = False
+# mask setup
 
 
 if (in_scale := float(rc['timescale']['in'])) != 1.0:
@@ -252,28 +288,156 @@ if (dt := rc['miscellaneous']['dedup threshold']).lower() not in NO:
 # deduplication
 
 
+am = rc['artifact masking']
+MASK_PREVIEW = (
+    am['enabled'].lower() in YES
+    and am['preview mask'].lower() in YES
+)
+MASK_REQUIRED = (
+    (rc['pre-interp']['enabled'].lower() in YES
+     and rc['pre-interp']['masking'].lower() in YES)
+    or (rc['interpolation']['enabled'].lower() in YES
+        and rc['interpolation']['masking'].lower() in YES)
+    or (rc['flowblur']['enabled'].lower() in YES
+        and rc['flowblur']['masking'].lower() in YES)
+)
+
+if am['enabled'].lower() in YES and (MASK_REQUIRED or MASK_PREVIEW):
+    mode = am['mode'].strip().lower()
+
+    if mode == 'manual':
+        PROTECTION_MASK = load_manual_mask(am, required=True)
+    elif mode == 'automatic':
+        AUTOMATIC_PROTECTION_MASK = True
+        automatic_mask = hudmask.generate(
+            clip=clip,
+            sensitivity=float(am['auto sensitivity']),
+            sample_count=int(am['auto samples'])
+        )
+        # A filename is optional in automatic mode. If supplied, its protected
+        # areas are added to the automatically detected ones.
+        manual_mask = load_manual_mask(am, required=False)
+        PROTECTION_MASK = combine_protection_masks(
+            [automatic_mask, manual_mask]
+        )
+    else:
+        raise ValueError(
+            f"Unknown `[artifact masking] mode:` '{am['mode']}', "
+            "expected manual or automatic"
+        )
+
+
+def prepare_protection_mask(mask: vs.VideoNode, reference: vs.VideoNode):
+    gray_format = reference.format.replace(
+        color_family=vs.GRAY,
+        subsampling_w=0,
+        subsampling_h=0
+    )
+    mask = core.std.ShufflePlanes(mask, planes=0, colorfamily=vs.GRAY)
+    mask = core.resize.Bicubic(
+        mask,
+        width=reference.width,
+        height=reference.height,
+        format=gray_format
+    )
+
+    if rc['artifact masking']['feathering'] in YES:
+        if AUTOMATIC_PROTECTION_MASK:
+            mask = mask.std.Minimum().std.BoxBlur(
+                vradius=2,
+                hradius=2,
+                vpasses=1,
+                hpasses=1
+            )
+        else:
+            mask = mask.std.Minimum().std.BoxBlur(
+                vradius=6,
+                hradius=6,
+                vpasses=2,
+                hpasses=2
+            )
+
+    if mask.num_frames == 1:
+        return mask[0] * reference.num_frames
+
+    if mask.fps != reference.fps:
+        mask = havsfunc.ChangeFPS(
+            mask,
+            fpsnum=reference.fps.numerator,
+            fpsden=reference.fps.denominator
+        )
+
+    if mask.num_frames < reference.num_frames:
+        mask += mask[-1] * (reference.num_frames - mask.num_frames)
+    return mask[:reference.num_frames]
+
+
+def restore_hud_detail(
+        processed_clip: vs.VideoNode,
+        original_clip: vs.VideoNode,
+        protection_mask: vs.VideoNode,
+):
+    # Replace only local high-frequency detail instead of pasting the original
+    # pixels back over a motion-blurred frame. Keeping the processed low
+    # frequencies avoids bright/dark islands at mask boundaries.
+    processed_soft = core.std.BoxBlur(
+        processed_clip,
+        hradius=2,
+        vradius=2,
+        hpasses=1,
+        vpasses=1
+    )
+    original_soft = core.std.BoxBlur(
+        original_clip,
+        hradius=2,
+        vradius=2,
+        hpasses=1,
+        vpasses=1
+    )
+    processed_detail = core.std.MakeDiff(processed_clip, processed_soft)
+    original_detail = core.std.MakeDiff(original_clip, original_soft)
+    detail_correction = core.std.MakeDiff(
+        original_detail,
+        processed_detail
+    )
+    neutral_correction = core.std.MakeDiff(
+        processed_clip,
+        processed_clip
+    )
+    hud_selection = core.std.Invert(protection_mask)
+    masked_correction = core.std.MaskedMerge(
+        clipa=neutral_correction,
+        clipb=detail_correction,
+        mask=hud_selection,
+        first_plane=True
+    )
+    return core.std.MergeDiff(processed_clip, masked_correction)
+
+
 def Masking(
         to_mask: vs.VideoNode,
         original_clip: vs.VideoNode,
 ):
-    if MASK_PATH is None:
+    if PROTECTION_MASK is None:
         return to_mask
 
     if to_mask.fps != original_clip.fps:
         original_clip = havsfunc.ChangeFPS(original_clip, fpsnum=to_mask.fps.numerator, fpsden=to_mask.fps.denominator)
 
-    og_clip_format = clip.format
+    mask = prepare_protection_mask(PROTECTION_MASK, to_mask)
+    if AUTOMATIC_PROTECTION_MASK:
+        return restore_hud_detail(
+            processed_clip=to_mask,
+            original_clip=original_clip,
+            protection_mask=mask
+        )
 
-    # technically a source as well, but it's 1 image, we chill
-    mask_src = core.ffms2.Source(MASK_PATH)
-
-    if to_mask.format.name == 'RGBS':
-        mask_src = core.resize.Bicubic(clip=mask_src, format=vs.RGBS)
-
-    if rc['artifact masking']['feathering'] in YES:
-        mask_src = mask_src.std.Minimum().std.BoxBlur(vradius=6, hradius=6, vpasses=2, hpasses=2)
-
-    return core.std.MaskedMerge(clipa=original_clip, clipb=to_mask, mask=mask_src, first_plane=True)
+    return core.std.MaskedMerge(
+        clipa=original_clip,
+        clipb=to_mask,
+        mask=mask,
+        first_plane=True
+    )
 
 
 # mask func
@@ -534,6 +698,7 @@ if (fbd := rc['frame blending'])['enabled'].lower() in YES:
         fps = round(clip.fps_num / clip.fps_den)
 
         clip = havsfunc.ChangeFPS(clip, int(fbd['fps']))
+
         verb(
             f'Blending {fps} down to {fbd["fps"]} @ {fbd["intensity"]} intensity ({len(weights)} blur-frames) ' +
             f"using '{fbd['weighting']}' => " + blending.format_vec(weights)
@@ -575,5 +740,10 @@ if (lt := rc['lut'])['enabled'].lower() in YES:
 
 if 'video_in' in globals():
     clip = core.std.AssumeFPS(clip, fpsnum=rc['frame blending']['fps'])
+
+if MASK_PREVIEW:
+    if PROTECTION_MASK is None:
+        raise ValueError("Mask preview was enabled without an active artifact mask")
+    clip = prepare_protection_mask(PROTECTION_MASK, clip)
 
 clip.set_output()

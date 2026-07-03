@@ -1,75 +1,54 @@
-<p href="">
-    <img src="https://ctt.cx/assets/images/video/smoothie/smoothie-gui.webp" width="220"  align="right">
-</p>
+# Smoothie - automatic HUD protection fork
 
-<h1 align="center">
-    <!-- yup if i put a line break they're not actually centered =( -->
-    <img src="https://raw.githubusercontent.com/couleur-tweak-tips/CTT/refs/heads/main/overrides/.icons/custom/smoothie.svg" width=100 /> Smoothie
-</h1>
-<p align="center">
-    add motion blur to videos, with granular configuration
-</p>
-<p align="center">
-    </a>
-        <a href="https://ctt.cx/smoothie">
-        <img src="https://img.shields.io/badge/Documentation-526CFE?logo=MaterialForMkDocs&logoColor=white" alt="License" />
-    </a>
-    <a href="https://discord.com/channels/774315187183288411/1051234238835474502">
-        <img src="https://img.shields.io/badge/HOF%20render%20tests-white?logo=discord" alt=".gg/CTT render tests" />
-    </a>
-    <a href="https://www.youtube.com/playlist?list=PLrsLsEZL_o4M_yTqZGwN5cM5ZxJTqkWkZ">
-        <img src="https://img.shields.io/badge/Demo%20Playlist-FF0000?logo=youtube" alt="Demo Playlist" />
-    </a>
-    <a href="https://github.com/couleur-tweak-tips/SmoothieInstaller/releases/latest/download/SmoothieInstaller.exe">
-        <img src="https://img.shields.io/badge/Download%20Installer-8A2BE2" alt="Download" />
-    </a>
-    <a href="https://github.com/couleur-tweak-tips/smoothie-rs/releases/latest/download/smoothie-rs-nightly.zip">
-        <img src="https://img.shields.io/badge/Download%20Portable%20zip-8A2BE2" alt="Download" />
-    </a>
-    <a href="https://github.com/couleur-tweak-tips/smoothie-rs/blob/master/LICENSE">
-        <img src="https://img.shields.io/github/license/couleur-tweak-tips/smoothie-rs.svg" alt="License" />
-</p>
+This fork of [Smoothie](https://github.com/couleur-tweak-tips/smoothie-rs)
+adds automatic protection for crosshairs, HUD elements, input overlays, and
+other graphics that remain fixed on screen.
 
-smoothie-rs is a rewrite of [smoothie](https://github.com/couleur-tweak-tips/smoothie) in rust, find the documentation over on [ctt.cx/smoothie](https://ctt.cx/video/smoothie)
+Smoothie can create very smooth motion blur by interpolating and blending
+frames. In game footage, motion-based filters may also distort the HUD. This
+fork analyzes the video, finds persistent screen-fixed details, and keeps them
+clear while the game world is processed normally.
 
-Thanks to tekno, yalter and anima for inspiration
+## What this fork adds
 
-## What is smoothie for?
+- Automatic HUD and crosshair detection.
+- Protection during frame interpolation and FlowBlur.
+- No game-specific profiles or hand-made masks required.
+- Optional mask preview for checking a clip before rendering.
+- Manual masks remain supported when automatic detection needs help.
 
-Smoothie can be used to apply motion blur to video-game footage (or anything really, tho it was designed in mind for fast-paced FPS games), 
+HUD protection is enabled by default. Existing interpolation, frame blending,
+FlowBlur, encoding, and recipe controls remain available.
 
-it has features similar to [blur's](https://ctt.cx/smoothievsblur),  [VEGAS Pro's frame sampling (frame blending)](https://ctt.cx/recipe#frame-blending), [RSMB](https://ctt.cx/recipe#flowblur), [Flowframes](https://ctt.cx/recipe#pre-interp), and basic video editing capabilities ([cutting](https://github.com/couleur-tweak-tips/suckless-cut), [basic color grading](https://ctt.cx/recipe#color-grading),[LUT](https://ctt.cx/recipe#LUT)..) <!-- [and scaling](https://github.com/user-attachments/assets/4c547387-d39f-44d2-93de-4c88f28cc6c0) -->
+## Download and use
 
-It acts as an all-in-one filter chain, you can individually toggle and configure each component however you like via the [recipe](https://ctt.cx/recipe).
+1. Download the [latest release](../../releases/latest/download/smoothie-rs-nightly.zip).
+2. Extract the archive.
+3. Run `launch.cmd`.
+4. Select a video and render it normally.
 
-## Installer
+The automatic settings should work without adjustment. To inspect what was
+detected, enable `preview mask` under **artifact masking**. Black areas are
+protected; white areas receive normal processing. Disable the preview again
+for the final render.
 
-[Get the latest installer.exe here](https://github.com/couleur-tweak-tips/SmoothieInstaller/releases/latest/download/SmoothieInstaller.exe)
+If detection is too broad or too narrow, adjust `auto sensitivity`:
 
-https://github.com/user-attachments/assets/ccf22785-0751-4989-9fa4-dec653d7679a
+- Lower values are stricter and produce tighter masks.
+- Higher values protect more of the image.
 
-## Portable
+## Building
 
-It's as simple as extracting the [latest nightly release zip](https://github.com/couleur-tweak-tips/smoothie-rs/releases/latest/download/smoothie-rs-nightly.zip) to a folder and running `launch.bat`
+```powershell
+cargo build --release
+```
 
-Here is also a short YouTube tutorial with extra tips (Send To & Acquiring RIFE models):
+The release workflow packages Smoothie together with its portable
+VapourSynth runtime.
 
-[![thumbnail of smrs installation tutorial youtube video](https://img.youtube.com/vi/RfPDgoMuSWg/maxresdefault.jpg)](https://www.youtube.com/watch?v=RfPDgoMuSWg)
+## Upstream and license
 
-<details><summary>about the now-removed README's roadmap</summary>
-
-Me and [anima](https://github.com/animafps) once considered [developping Smoothie-RS in such a way that it directly made use of VapourSynth as a library via a Rust wrapper](https://github.com/couleur-tweak-tips/smoothie-rs/pull/24) (and [occasionally ditching Python completely](https://github.com/couleur-tweak-tips/smoothie-rs/tree/db8181f7975b057c804b1c1b6fe365de0a7dc13e#roadmap)), but the only benefits I see are:
-
-* Slightly smaller package (50MB doesn't matter for much people nowadays)
-* Faster startup times because it wouldn't have to go through VSPipe
-* It could also allow more fancy ways to output (e.g render a VSNode once but pipe it to two processes at once?)
-
-And developping it would mean:
-
-* Compiling would be much more complex since it'd be OS-based to link VapourSynth's library
-* All of the logic in the easy python code would have to be rewritten in Rust / C
-
-I don't consider it worth working on nowadays
-</details>
-
-
+This project is based on
+[couleur-tweak-tips/smoothie-rs](https://github.com/couleur-tweak-tips/smoothie-rs).
+The original project and this fork are distributed under the
+[GNU General Public License v3.0](./LICENSE).
