@@ -1,40 +1,74 @@
-# Smoothie - automatic HUD protection fork
+# Smoothie *improved*
 
 This fork of [Smoothie](https://github.com/couleur-tweak-tips/smoothie-rs)
-adds automatic protection for crosshairs, HUD elements, input overlays, and
-other graphics that remain fixed on screen.
+is made for turning gameplay recordings into smooth, shareable clips without
+destroying the crosshair and HUD in the process.
 
-Smoothie can create very smooth motion blur by interpolating and blending
-frames. In game footage, motion-based filters may also distort the HUD. This
-fork analyzes the video, finds persistent screen-fixed details, and keeps them
-clear while the game world is processed normally.
+It keeps Smoothie's interpolation, frame blending, FlowBlur, encoding, and
+recipe controls, while adding automatic HUD protection and a complete trimming
+workflow inside the app.
 
-## What this fork adds
+## Features added by this fork
 
-- Automatic HUD and crosshair detection.
-- Protection during frame interpolation and FlowBlur.
-- No game-specific profiles or hand-made masks required.
-- Optional mask preview for checking a clip before rendering.
-- Manual masks remain supported when automatic detection needs help.
+### Automatic HUD protection
 
-HUD protection is enabled by default. Existing interpolation, frame blending,
-FlowBlur, encoding, and recipe controls remain available.
+- Detects persistent screen-fixed details such as crosshairs, health bars,
+  ability icons, minimaps, input overlays, and static text.
+- Keeps detected details sharp during interpolation and FlowBlur while the game
+  world still receives normal motion processing.
+- Works automatically without requiring a game profile or hand-drawn mask.
+- Enabled by default, with an optional mask preview so you can inspect what will
+  be protected before rendering.
+- Still supports manual masks for unusual footage or additional corrections.
+- Fails conservatively when a clip does not contain enough visual movement for
+  reliable automatic detection.
 
-## Download and use
+Automatic detection is intended for persistent HUD elements. Animated alerts,
+killfeeds, damage effects, and other short-lived overlays may not always be
+detected.
+
+### Built-in clip trimmer
+
+- Drag one or more recordings directly into the app.
+- Preview video and audio without leaving Smoothie.
+- Scrub using timeline thumbnails and frame-step controls.
+- Select frame-accurate in and out points with timeline handles, timestamps, or
+  the `I` and `O` shortcuts.
+- Choose exactly which audio tracks to keep, and audition tracks individually.
+- Configure multiple clips in a queue and render them together.
+
+### Share-ready file-size targeting
+
+- Optionally keep each rendered clip below a limit such as `50 MB` for Discord.
+- Produces a broadly compatible MP4 with H.264 video and AAC audio.
+- Calculates an appropriate bitrate from the selected duration and audio tracks.
+- Verifies the finished file size and automatically retries at a corrected
+  bitrate only if the result exceeds the limit.
+- Uses a fast single-pass render in the normal case, so Smoothie's interpolation
+  and blur pipeline is not unnecessarily processed twice.
+
+Leave size targeting disabled to use the encoder and container selected in your
+recipe unchanged.
+
+## Quick start
 
 1. Download the [latest release](../../releases/latest/download/smoothie-rs-nightly.zip).
-2. Extract the archive.
-3. Run `launch.cmd`.
-4. Select a video and render it normally.
+2. Extract the archive and run `launch.cmd`.
+3. Drop in one or more videos.
+4. Select each clip's range, audio tracks, and optional file-size limit.
+5. Select **Render all clips**.
 
-The automatic settings should work without adjustment. To inspect what was
-detected, enable `preview mask` under **artifact masking**. Black areas are
-protected; white areas receive normal processing. Disable the preview again
-for the final render.
+HUD protection is already enabled with sensible defaults.
 
-If detection is too broad or too narrow, adjust `auto sensitivity`:
+## Adjusting HUD detection
 
-- Lower values are stricter and produce tighter masks.
+Enable `preview mask` under **artifact masking** to inspect the automatic mask.
+Black areas are protected; white areas receive normal processing. Disable the
+preview again before the final render.
+
+If the mask needs adjustment, change `auto sensitivity`:
+
+- Lower values create stricter, tighter protection.
 - Higher values protect more of the image.
 
 ## Building
@@ -43,8 +77,7 @@ If detection is too broad or too narrow, adjust `auto sensitivity`:
 cargo build --release
 ```
 
-The release workflow packages Smoothie together with its portable
-VapourSynth runtime.
+The release workflow packages Smoothie with its portable VapourSynth runtime.
 
 ## Upstream and license
 
