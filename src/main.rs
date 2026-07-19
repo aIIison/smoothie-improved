@@ -13,6 +13,7 @@ mod cli;
 mod cmd;
 mod ffpb;
 mod smgui;
+mod trimmer;
 // mod ffpb2;
 mod parse;
 mod portable;
@@ -22,7 +23,7 @@ mod utils;
 //mod vapoursynth;
 mod video;
 
-use crate::{cli::Arguments, cmd::SmCommand, video::Payload};
+use crate::{cli::Arguments, cmd::SmCommand, video::GuiClipJob};
 use std::{env, sync::mpsc::channel};
 use utils::verbosity_init;
 
@@ -75,8 +76,7 @@ fn main() {
         utils::set_window_position(&recipe);
     }
 
-    let payloads: Vec<Payload>;
-    let (recipe, mut args) = if args.input.is_empty() && !args.tui {
+    let (recipe, mut args, gui_jobs) = if args.input.is_empty() && !args.tui {
         #[cfg(windows)]
         let hwnd: Option<*mut winapi::shared::windef::HWND__> = if cfg!(windows) {
             unsafe {
@@ -108,7 +108,7 @@ fn main() {
         #[cfg(not(windows))]
         type WinHWND = ();
 
-        let (sender, receiver) = channel::<(Recipe, Arguments, WinHWND)>();
+        let (sender, receiver) = channel::<(Recipe, Arguments, Vec<GuiClipJob>, WinHWND)>();
 
         let _ret = smgui::sm_gui(recipe.clone(), _metadata, args, sender);
 
@@ -121,14 +121,14 @@ fn main() {
             }
         }
 
-        if let Ok((args, recipe, hwnd)) = receiver.recv() {
+        if let Ok((recipe, args, jobs, hwnd)) = receiver.recv() {
             #[cfg(windows)]
             unsafe {
                 let _ret = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(hwnd.unwrap());
                 // dbg!(&_ret);
             }
 
-            (args, recipe)
+            (recipe, args, Some(jobs))
         } else {
             std::process::exit(0);
             // panic!("Failed retrieving data from GUI");
@@ -136,13 +136,17 @@ fn main() {
         }
     } else {
         // data was already retrieved from CLI, just pass them back
-        (recipe, args)
+        (recipe, args, None)
     };
 
     let return_recipe = args.return_recipe;
     let progress = args.progress;
 
-    payloads = video::resolve_input(&mut args, &recipe);
+    let payloads = if let Some(jobs) = gui_jobs {
+        video::resolve_gui_jobs(&mut args, &recipe, jobs)
+    } else {
+        video::resolve_input(&mut args, &recipe)
+    };
     let commands: Vec<SmCommand> = cmd::build_commands(args, payloads, recipe);
     if return_recipe {
         for command in commands {

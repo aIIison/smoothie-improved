@@ -14,6 +14,22 @@ pub struct Payload {
     pub basename: String,  // Equivalent to .NET's [IO.Path]::GetFileNameWithoutExtension
     pub probe: FfProbe,    // provided by ffprobe
     pub timecodes: Option<Vec<Timecodes>>,
+    pub selection: Option<ClipSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClipSelection {
+    pub start_seconds: f64,
+    pub end_seconds: f64,
+    pub audio_stream_indices: Vec<i64>,
+    pub max_size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GuiClipJob {
+    pub path: PathBuf,
+    pub probe: FfProbe,
+    pub selection: ClipSelection,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -23,7 +39,7 @@ pub struct Timecodes {
 }
 
 /// Only returns videos that are valid (exists, ffprobe-able)
-fn probe_video(input: &PathBuf) -> Option<FfProbe> {
+pub fn probe_video(input: &PathBuf) -> Option<FfProbe> {
     let path = match input.canonicalize() {
         Ok(path) => path,
         _ => {
@@ -104,24 +120,24 @@ pub fn resolve_outpath(
         // .to_uppercase()
     };
 
-    let gof:Option<String>=recipe.get_option("miscellaneous", "global output folder"); 
+    let gof: Option<String> = recipe.get_option("miscellaneous", "global output folder");
 
     let out_dir = if let Some(ref outdir) = args.outdir {
         if !outdir.is_dir() {
             panic!("--outdir {outdir:?} does not exist or is not a directory");
         }
         outdir.canonicalize().unwrap_or_else(|_| outdir.clone())
-    } else if gof.is_some() && !gof.unwrap().is_empty(){
+    } else if gof.is_some() && !gof.unwrap().is_empty() {
         let recipe_outdir = recipe.get("miscellaneous", "global output folder");
         let recipe_path = PathBuf::from(recipe_outdir.trim());
 
         if !recipe_path.is_dir() {
             panic!("Recipe's global output folder {recipe_path:?} does not exist or is not a directory");
         }
-            recipe_path.canonicalize().unwrap_or(recipe_path)
-        } else {
-            in_dir
-        };
+        recipe_path.canonicalize().unwrap_or(recipe_path)
+    } else {
+        in_dir
+    };
 
     if format.contains("%FRUITS%") || format.contains("%FRUIT") {
         format = format.replace("%FRUIT%", "%FRUITS%").replace(
@@ -308,7 +324,61 @@ pub fn resolve_input(args: &mut Arguments, recipe: &Recipe) -> Vec<Payload> {
                 .to_string(),
             probe,
             timecodes,
+            selection: None,
         })
+    }
+
+    if payloads.is_empty() {
+        panic!("No valid videos were passed to Smoothie")
+    }
+
+    payloads
+}
+
+/// Converts clip-specific selections made by the GUI into normal render payloads.
+/// CLI inputs deliberately continue through `resolve_input` unchanged.
+pub fn resolve_gui_jobs(
+    args: &mut Arguments,
+    recipe: &Recipe,
+    jobs: Vec<GuiClipJob>,
+) -> Vec<Payload> {
+    let mut payloads = Vec::with_capacity(jobs.len());
+
+    for job in jobs {
+        let path = job.path.canonicalize().unwrap_or_else(|_| job.path.clone());
+        let basename = path
+            .file_stem()
+            .expect("Failed getting input filename stem")
+            .to_string_lossy()
+            .to_string();
+        let mut out_path = resolve_outpath(
+            args,
+            recipe,
+            path.parent().unwrap().to_path_buf(),
+            basename.clone(),
+            false,
+        );
+
+        if job.selection.max_size_bytes.is_some() {
+            out_path.set_extension("mp4");
+            let original = out_path.clone();
+            let stem = original.file_stem().unwrap().to_string_lossy().to_string();
+            let parent = original.parent().unwrap();
+            let mut suffix = 2;
+            while out_path.exists() {
+                out_path = parent.join(format!("{stem} ({suffix}).mp4"));
+                suffix += 1;
+            }
+        }
+
+        payloads.push(Payload {
+            in_path: path,
+            out_path,
+            basename,
+            probe: job.probe,
+            timecodes: None,
+            selection: Some(job.selection),
+        });
     }
 
     if payloads.is_empty() {

@@ -1,17 +1,20 @@
 use crate::{
     cli::Arguments,
     recipe::{export_recipe, parse_recipe, Recipe, WidgetMetadata},
-};
-use std::{
-    fs::File, io::Write,
-    path::PathBuf,
-    sync::mpsc::Sender // used to retrieve SmCommands
+    trimmer::{Trimmer, TrimmerAction},
+    video::GuiClipJob,
 };
 use copypasta::{ClipboardContext, ClipboardProvider};
 use eframe::egui;
+use indexmap::map::IndexMap;
+use std::{
+    fs::File,
+    io::Write,
+    path::PathBuf,
+    sync::mpsc::Sender, // used to retrieve SmCommands
+};
 #[cfg(windows)]
 use winit::raw_window_handle::HasWindowHandle;
-use indexmap::map::IndexMap;
 
 #[cfg(windows)]
 type WinHWND = Option<windows::Win32::Foundation::HWND>;
@@ -24,7 +27,8 @@ struct SmApp {
     recipe_change_request: Option<String>,
     recipe: Recipe,
     metadata: WidgetMetadata,
-    selected_files: Vec<PathBuf>,
+    trimmer: Trimmer,
+    render_jobs: Vec<GuiClipJob>,
     show_confirmation_dialog: bool,
     show_merge_dialog: bool,
     staging_merge: Option<(Recipe, IndexMap<String, IndexMap<String, bool>>)>,
@@ -34,7 +38,7 @@ struct SmApp {
     start_rendering: bool,
     // yeah that's the damn typename
     recipe_saved: String,
-    sender: Sender<(Recipe, Arguments, WinHWND)>,
+    sender: Sender<(Recipe, Arguments, Vec<GuiClipJob>, WinHWND)>,
     make_new_recipe: bool,
     new_recipe_filename: String,
 }
@@ -89,7 +93,7 @@ pub fn sm_gui<'gui>(
     recipe: Recipe,
     metadata: WidgetMetadata,
     args: Arguments,
-    sender: Sender<(Recipe, Arguments, WinHWND)>,
+    sender: Sender<(Recipe, Arguments, Vec<GuiClipJob>, WinHWND)>,
 ) -> Result<(), eframe::Error> {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
 
@@ -99,49 +103,45 @@ pub fn sm_gui<'gui>(
                 // NOTE: Adding an icon is optional
                 eframe::icon_data::from_png_bytes(&include_bytes!("smoothie-32x.png")[..]).unwrap(),
             )
-            .with_inner_size([320.0, 900.0]),
+            .with_inner_size([1100.0, 820.0])
+            .with_min_inner_size([760.0, 620.0]),
         ..Default::default()
     };
-
 
     eframe::run_native(
         WINDOW_NAME,
         options,
-        Box::new(|_cc|{
-
-           Ok(Box::new(
-                SmApp {
-                    show_merge_dialog: false,
-                    staging_merge: None,
-                    first_frame: true,
-                    save_new_recipe: false,
-                    recipe_change_request: None,
-                    recipe_saved: format!("{:?}", recipe),
-                    recipe,
-                    metadata,
-                    selected_files: vec![], // file select dialog with render button
-                    show_confirmation_dialog: false,
-                    allowed_to_close: false,
-                    show_about: false,
-                    args,
-                    start_rendering: false,
-                    sender,
-                    make_new_recipe: false,
-                    new_recipe_filename: String::new(),
-            }
-        ))
-    }),
+        Box::new(|_cc| {
+            Ok(Box::new(SmApp {
+                show_merge_dialog: false,
+                staging_merge: None,
+                first_frame: true,
+                save_new_recipe: false,
+                recipe_change_request: None,
+                recipe_saved: format!("{:?}", recipe),
+                recipe,
+                metadata,
+                trimmer: Trimmer::new(),
+                render_jobs: vec![],
+                show_confirmation_dialog: false,
+                allowed_to_close: false,
+                show_about: false,
+                args,
+                start_rendering: false,
+                sender,
+                make_new_recipe: false,
+                new_recipe_filename: String::new(),
+            }))
+        }),
     )
 }
 
-
 impl eframe::App for SmApp {
-    
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.start_rendering {
                 let mut scoped_args = self.args.clone();
-                scoped_args.input = self.selected_files.clone();
+                scoped_args.input = self.render_jobs.iter().map(|job| job.path.clone()).collect();
 
                 #[cfg(windows)]
                 let hwnd: Option<windows::Win32::Foundation::HWND> = {
@@ -154,13 +154,13 @@ impl eframe::App for SmApp {
 
                 #[cfg(not(windows))]
                 let hwnd: WinHWND = ();
-                let send_result = self.sender.send((self.recipe.clone(), scoped_args, hwnd));
+                let jobs = std::mem::take(&mut self.render_jobs);
+                let send_result = self.sender.send((self.recipe.clone(), scoped_args, jobs, hwnd));
 
                 if let Err(e) = send_result {
                     eprintln!("Retrieving filepaths from GUI panicked: {:?}", e);
                 }
 
-                self.selected_files.clear();
                 self.start_rendering = false;
        
                 // self.show_confirmation_dialog = true;
@@ -169,12 +169,22 @@ impl eframe::App for SmApp {
                 // std::thread::spawn(move || {
                 //     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 // });
-                self.selected_files.clear();
-                self.start_rendering = false;
-
                 // self.show_confirmation_dialog = false;
                 // self.allowed_to_close = true;
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+
+            if !self.trimmer.is_empty() {
+                if let Some(TrimmerAction::Render(jobs)) = self.trimmer.ui(ctx, ui) {
+                    self.render_jobs = jobs;
+                    self.start_rendering = true;
+                }
+                preview_files_being_dropped(ctx);
+                let dropped = dropped_video_paths(ctx);
+                if !dropped.is_empty() {
+                    self.trimmer.add_paths(dropped);
+                }
+                return;
             }
  
             let ctrl_s = egui::KeyboardShortcut {
@@ -230,8 +240,8 @@ impl eframe::App for SmApp {
                     }
                 };
                 if ui
-                    .button("render")
-                    .on_hover_text_at_pointer("select videos to render with")
+                    .button("add clips")
+                    .on_hover_text_at_pointer("select videos to trim and render")
                     .clicked()
                 {
                     let input = rfd::FileDialog::new()
@@ -243,8 +253,7 @@ impl eframe::App for SmApp {
                     if let Some(input_vids) = input {
                         // used in an if statement later down
                         if !input_vids.is_empty() {
-                            self.selected_files = input_vids;
-                            self.start_rendering = true;
+                            self.trimmer.add_paths(input_vids);
                         }
                     }
                 }
@@ -494,35 +503,10 @@ impl eframe::App for SmApp {
 
             preview_files_being_dropped(ctx);
 
-            ctx.input(|i| {
-                if !i.raw.dropped_files.is_empty() {
-                    for file in i.raw.dropped_files.clone() {
-                        if let Some(path) = file.path {
-                            if let Some(ext_str) = path.extension() {
-                                if crate::VIDEO_EXTENSIONS.contains(
-                                    &ext_str
-                                        .to_ascii_lowercase()
-                                        .as_os_str()
-                                        .to_str()
-                                        .expect("Failed convertin file extension to string"),
-                                ) {
-                                    self.selected_files.push(path)
-                                } else {
-                                    eprintln!("Skipping file with no extension:");
-                                    dbg!(&path);
-                                }
-                            }
-                        } else {
-                            eprintln!("Skipping DroppedFile with no path attribute:");
-                            dbg!(&file);
-                        }
-                    }
-                }
-
-                if !self.selected_files.is_empty() {
-                    self.start_rendering = true;
-                }
-            });
+            let dropped = dropped_video_paths(ctx);
+            if !dropped.is_empty() {
+                self.trimmer.add_paths(dropped);
+            }
 
             if self.make_new_recipe {
                 let mut open = true;
@@ -711,6 +695,7 @@ impl eframe::App for SmApp {
             }
             
             if ctx.input(|i| i.viewport().close_requested()) && !self.allowed_to_close {
+                self.trimmer.stop();
                 {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     self.show_confirmation_dialog = true;
@@ -851,4 +836,22 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
             Color32::WHITE,
         );
     }
+}
+
+fn dropped_video_paths(ctx: &egui::Context) -> Vec<PathBuf> {
+    ctx.input(|input| {
+        input
+            .raw
+            .dropped_files
+            .iter()
+            .filter_map(|file| file.path.clone())
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        crate::VIDEO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+                    })
+            })
+            .collect()
+    })
 }

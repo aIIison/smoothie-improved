@@ -7,7 +7,7 @@ from os import path
 from os import environ
 import sys
 from tempfile import gettempdir # ffms2 index
-from math import floor # toframes()
+from math import floor, ceil # toframes() and GUI trim boundaries
 import json # loading recipe
 import re # get_sec()
 
@@ -131,6 +131,25 @@ else:
                 cachefile=cache_file
             )
 # source plugin
+
+# GUI trimmer: cut the source before any analysis, interpolation, or blur work.
+# The end is exclusive and rounded up so the selected final source frame is kept.
+if 'trim_start' in globals() or 'trim_end' in globals():
+    source_fps = float(clip.fps)
+    start_seconds = float(trim_start) if 'trim_start' in globals() else 0.0
+    end_seconds = float(trim_end) if 'trim_end' in globals() else clip.num_frames / source_fps
+    # Small epsilon prevents a serialized frame-snapped timestamp from gaining
+    # or losing a frame through floating-point roundoff.
+    start_frame = max(0, floor(start_seconds * source_fps + 1e-6))
+    end_frame = min(clip.num_frames, ceil(end_seconds * source_fps - 1e-6))
+    if end_frame <= start_frame:
+        raise ValueError(f"Invalid trim range: {start_seconds:.6f} to {end_seconds:.6f}")
+    verb(
+        f"TRIM: {start_seconds:.6f}s-{end_seconds:.6f}s "
+        f"(frames {start_frame}-{end_frame - 1})"
+    )
+    clip = clip[start_frame:end_frame]
+# GUI trimmer
 
 # this is for fps comparisons
 if rc.get('runtime') and rc.get('runtime').get('fpscap'):
