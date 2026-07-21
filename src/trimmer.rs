@@ -7,6 +7,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use which::which;
@@ -14,11 +18,13 @@ use which::which;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-const PREVIEW_WIDTH: usize = 960;
-const PREVIEW_HEIGHT: usize = 540;
+const PREVIEW_WIDTH: usize = 768;
+const PREVIEW_HEIGHT: usize = 432;
+const PREVIEW_FPS: f64 = 30.0;
 const THUMB_WIDTH: usize = 160;
 const THUMB_HEIGHT: usize = 90;
 const THUMB_COUNT: usize = 12;
+const THUMB_WORKERS: usize = 3;
 
 pub enum TrimmerAction {
     Render(Vec<GuiClipJob>),
@@ -40,7 +46,7 @@ struct AudioTrack {
 struct PreviewPlayer {
     video: Option<Child>,
     audio: Option<Child>,
-    frames: Option<Receiver<Vec<u8>>>,
+    frames: Option<Receiver<(u64, Vec<u8>)>>,
     origin: f64,
     started: Option<Instant>,
 }
@@ -99,7 +105,7 @@ impl PreviewPlayer {
         }
 
         let filter = format!(
-            "scale={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:force_original_aspect_ratio=decrease,pad={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps=30"
+            "scale={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:force_original_aspect_ratio=decrease,pad={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={PREVIEW_FPS}"
         );
         let mut command = quiet_command(&ffmpeg);
         let mut video = command
@@ -122,7 +128,9 @@ impl PreviewPlayer {
             .map_err(|error| format!("Failed to start preview decoder: {error}"))?;
 
         let mut stdout = video.stdout.take().ok_or("Preview decoder had no output")?;
-        let (sender, receiver) = mpsc::sync_channel(2);
+        // A single buffered frame keeps playback responsive instead of letting
+        // decoded frames queue up behind the UI and making seeking feel delayed.
+        let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || read_preview_frames(&mut stdout, sender));
 
         let audio = if let (Some(stream), Ok(ffplay)) = (audio_stream, which("ffplay")) {
@@ -173,6 +181,7 @@ pub struct TrimmerClip {
     start: f64,
     end: f64,
     playhead: f64,
+    displayed_position: f64,
     start_text: String,
     end_text: String,
     audio_tracks: Vec<AudioTrack>,
@@ -181,10 +190,11 @@ pub struct TrimmerClip {
     size_mb: f64,
     preview: PreviewPlayer,
     preview_texture: Option<TextureHandle>,
-    still_receiver: Option<Receiver<(u64, Vec<u8>)>>,
+    still_receiver: Option<Receiver<(u64, f64, Vec<u8>)>>,
     pending_still: Option<(Instant, f64)>,
     still_generation: u64,
     thumbnails_receiver: Option<Receiver<Vec<Vec<u8>>>>,
+    thumbnails_started: bool,
     thumbnails: Vec<TextureHandle>,
     drag_target: Option<DragTarget>,
     error: Option<String>,
@@ -256,6 +266,7 @@ impl TrimmerClip {
             start: 0.0,
             end: duration,
             playhead: 0.0,
+            displayed_position: 0.0,
             start_text: format_time(0.0),
             end_text: format_time(duration),
             audio_tracks,
@@ -268,6 +279,7 @@ impl TrimmerClip {
             pending_still: None,
             still_generation: 0,
             thumbnails_receiver: None,
+            thumbnails_started: false,
             thumbnails: Vec::new(),
             drag_target: None,
             error: None,
@@ -275,7 +287,6 @@ impl TrimmerClip {
             resume_after_seek: false,
         };
         clip.request_still(0.0);
-        clip.request_thumbnails();
         Ok(clip)
     }
 
@@ -289,7 +300,7 @@ impl TrimmerClip {
 
     fn request_still(&mut self, position: f64) {
         self.pending_still = Some((
-            Instant::now() + Duration::from_millis(100),
+            Instant::now() + Duration::from_millis(50),
             position.clamp(0.0, self.duration),
         ));
     }
@@ -302,38 +313,69 @@ impl TrimmerClip {
         self.still_receiver = Some(receiver);
         thread::spawn(move || {
             if let Some(frame) = decode_still(&path, position, PREVIEW_WIDTH, PREVIEW_HEIGHT) {
-                let _ = sender.send((generation, frame));
+                let _ = sender.send((generation, position, frame));
             }
         });
     }
 
     fn request_thumbnails(&mut self) {
+        self.thumbnails_started = true;
         let path = self.path.clone();
         let duration = self.duration;
         let (sender, receiver) = mpsc::channel();
         self.thumbnails_receiver = Some(receiver);
         thread::spawn(move || {
-            let mut frames = Vec::with_capacity(THUMB_COUNT);
-            for index in 0..THUMB_COUNT {
-                let position = duration * (index as f64 + 0.5) / THUMB_COUNT as f64;
-                if let Some(frame) = decode_still(&path, position, THUMB_WIDTH, THUMB_HEIGHT) {
-                    frames.push(frame);
-                }
+            let path = Arc::new(path);
+            let next_index = Arc::new(AtomicUsize::new(0));
+            let (frame_sender, frame_receiver) = mpsc::channel();
+            let mut workers = Vec::with_capacity(THUMB_WORKERS);
+            for _ in 0..THUMB_WORKERS {
+                let path = Arc::clone(&path);
+                let next_index = Arc::clone(&next_index);
+                let frame_sender = frame_sender.clone();
+                workers.push(thread::spawn(move || loop {
+                    let index = next_index.fetch_add(1, Ordering::Relaxed);
+                    if index >= THUMB_COUNT {
+                        break;
+                    }
+                    let position = duration * (index as f64 + 0.5) / THUMB_COUNT as f64;
+                    let frame = decode_still(&path, position, THUMB_WIDTH, THUMB_HEIGHT);
+                    let _ = frame_sender.send((index, frame));
+                }));
             }
+            drop(frame_sender);
+
+            let mut frames = vec![None; THUMB_COUNT];
+            for (index, frame) in frame_receiver {
+                frames[index] = frame;
+            }
+            for worker in workers {
+                let _ = worker.join();
+            }
+            let black = vec![0_u8; THUMB_WIDTH * THUMB_HEIGHT * 3];
+            let frames = frames
+                .into_iter()
+                .map(|frame| frame.unwrap_or_else(|| black.clone()))
+                .collect();
             let _ = sender.send(frames);
         });
     }
 
     fn poll_images(&mut self, ctx: &egui::Context, clip_index: usize) {
+        if !self.thumbnails_started {
+            self.request_thumbnails();
+        }
         if self.preview.is_playing()
             && self.last_preview_frame.elapsed() >= Duration::from_millis(33)
         {
-            let frame = self
+            let preview_frame = self
                 .preview
                 .frames
                 .as_ref()
                 .and_then(|receiver| receiver.try_recv().ok());
-            if let Some(frame) = frame {
+            if let Some((frame_index, frame)) = preview_frame {
+                self.displayed_position =
+                    self.snap(self.preview.origin + frame_index as f64 / PREVIEW_FPS);
                 self.set_preview_texture(ctx, clip_index, frame);
                 self.last_preview_frame = Instant::now();
             }
@@ -358,11 +400,12 @@ impl TrimmerClip {
         if clear_still_receiver {
             self.still_receiver = None;
         }
-        if let Some((generation, frame)) = still {
+        if let Some((generation, position, frame)) = still {
             if generation == self.still_generation
                 && self.pending_still.is_none()
                 && !self.preview.is_playing()
             {
+                self.displayed_position = self.snap(position);
                 self.set_preview_texture(ctx, clip_index, frame);
             }
         }
@@ -438,7 +481,9 @@ impl TrimmerClip {
 
     fn toggle_playback(&mut self) {
         if self.preview.is_playing() {
-            self.playhead = self.preview.stop().clamp(self.start, self.end);
+            self.preview.stop();
+            self.playhead = self.displayed_position.clamp(self.start, self.end);
+            self.preview.origin = self.playhead;
             self.request_still(self.playhead);
         } else {
             self.start_playback();
@@ -576,26 +621,16 @@ impl Trimmer {
                 clip.toggle_playback();
             }
             if ctx.input(|input| input.key_pressed(egui::Key::I)) {
-                let was_playing = clip.preview.is_playing();
-                if was_playing {
-                    clip.playhead = clip.preview.stop();
-                }
-                clip.start = clip.playhead.min(clip.end - clip.frame_duration());
+                clip.start = clip
+                    .snap(clip.displayed_position)
+                    .min(clip.end - clip.frame_duration());
                 clip.start_text = format_time(clip.start);
-                if was_playing {
-                    clip.start_playback();
-                }
             }
             if ctx.input(|input| input.key_pressed(egui::Key::O)) {
-                let was_playing = clip.preview.is_playing();
-                if was_playing {
-                    clip.playhead = clip.preview.stop();
-                }
-                clip.end = clip.playhead.max(clip.start + clip.frame_duration());
+                clip.end = clip
+                    .snap(clip.displayed_position)
+                    .max(clip.start + clip.frame_duration());
                 clip.end_text = format_time(clip.end);
-                if was_playing {
-                    clip.start_playback();
-                }
             }
         }
 
@@ -871,13 +906,15 @@ fn timeline(ui: &mut egui::Ui, clip: &mut TrimmerClip) {
     }
 }
 
-fn read_preview_frames(stdout: &mut impl Read, sender: SyncSender<Vec<u8>>) {
+fn read_preview_frames(stdout: &mut impl Read, sender: SyncSender<(u64, Vec<u8>)>) {
     let frame_size = PREVIEW_WIDTH * PREVIEW_HEIGHT * 3;
+    let mut frame_index = 0_u64;
     loop {
         let mut frame = vec![0_u8; frame_size];
-        if stdout.read_exact(&mut frame).is_err() || sender.send(frame).is_err() {
+        if stdout.read_exact(&mut frame).is_err() || sender.send((frame_index, frame)).is_err() {
             break;
         }
+        frame_index += 1;
     }
 }
 
