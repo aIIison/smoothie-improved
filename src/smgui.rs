@@ -138,6 +138,19 @@ pub fn sm_gui<'gui>(
 
 impl eframe::App for SmApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if !self.trimmer.is_empty() {
+            egui::SidePanel::right("trimmer_workspace")
+                .resizable(true)
+                .default_width(760.0)
+                .min_width(520.0)
+                .show(ctx, |ui| {
+                    if let Some(TrimmerAction::Render(jobs)) = self.trimmer.ui(ctx, ui) {
+                        self.render_jobs = jobs;
+                        self.start_rendering = true;
+                    }
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.start_rendering {
                 let mut scoped_args = self.args.clone();
@@ -174,19 +187,6 @@ impl eframe::App for SmApp {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
 
-            if !self.trimmer.is_empty() {
-                if let Some(TrimmerAction::Render(jobs)) = self.trimmer.ui(ctx, ui) {
-                    self.render_jobs = jobs;
-                    self.start_rendering = true;
-                }
-                preview_files_being_dropped(ctx);
-                let dropped = dropped_video_paths(ctx);
-                if !dropped.is_empty() {
-                    self.trimmer.add_paths(dropped);
-                }
-                return;
-            }
- 
             let ctrl_s = egui::KeyboardShortcut {
                 modifiers: egui::Modifiers {
                     ctrl: true,
