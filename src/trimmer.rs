@@ -6,7 +6,7 @@ use ffprobe::FfProbe;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -24,7 +24,13 @@ const PREVIEW_FPS: f64 = 30.0;
 const THUMB_WIDTH: usize = 160;
 const THUMB_HEIGHT: usize = 90;
 const THUMB_COUNT: usize = 12;
-const THUMB_WORKERS: usize = 3;
+// One worker per thumbnail; every thumb is an independent tiny ffmpeg seek,
+// so saturating the machine with short-lived processes finishes in one round
+// instead of three. Spawning a dozen processes costs far less than decoding
+// twelve frames sequentially.
+const STILL_DEBOUNCE: Duration = Duration::from_millis(25);
+const MAX_IN_FLIGHT_STILLS: usize = 2;
+const STILL_CACHE_SIZE: usize = 16;
 
 pub enum TrimmerAction {
     Render(Vec<GuiClipJob>),
@@ -49,6 +55,17 @@ struct PreviewPlayer {
     frames: Option<Receiver<(u64, Vec<u8>)>>,
     origin: f64,
     started: Option<Instant>,
+}
+
+/// Everything needed to start a playback session from a trimmed clip.
+struct PlaybackSettings<'a> {
+    ffmpeg: &'a Path,
+    ffplay: Option<&'a Path>,
+    path: &'a Path,
+    position: f64,
+    end: f64,
+    audio_stream: Option<i64>,
+    source_fps: f64,
 }
 
 impl PreviewPlayer {
@@ -90,24 +107,35 @@ impl PreviewPlayer {
         position
     }
 
-    fn start(
-        &mut self,
-        path: &Path,
-        position: f64,
-        end: f64,
-        audio_stream: Option<i64>,
-    ) -> Result<(), String> {
+    fn start(&mut self, settings: PlaybackSettings<'_>) -> Result<(), String> {
         self.stop();
-        let ffmpeg = which("ffmpeg").map_err(|_| "FFmpeg was not found in PATH".to_owned())?;
+        let PlaybackSettings {
+            ffmpeg,
+            ffplay,
+            path,
+            position,
+            end,
+            audio_stream,
+            source_fps,
+        } = settings;
         let duration = (end - position).max(0.0);
         if duration <= 0.0 {
             return Ok(());
         }
 
+        // Decoding a 120 fps source frame-by-frame just to throw most frames
+        // away at the fps=30 stage wastes CPU. Skip input frames ahead of time
+        // whenever the source is comfortably faster than the preview.
+        let skip = (source_fps / PREVIEW_FPS).round() as u64;
+        let skip_filter = if skip > 1 {
+            format!(",select='not(mod(n\\,{skip}))'")
+        } else {
+            String::new()
+        };
         let filter = format!(
-            "scale={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:force_original_aspect_ratio=decrease,pad={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:(ow-iw)/2:(oh-ih)/2,fps={PREVIEW_FPS}"
+            "scale={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:force_original_aspect_ratio=decrease,pad={PREVIEW_WIDTH}:{PREVIEW_HEIGHT}:(ow-iw)/2:(oh-ih)/2{skip_filter},fps={PREVIEW_FPS}"
         );
-        let mut command = quiet_command(&ffmpeg);
+        let mut command = quiet_command(ffmpeg);
         let mut video = command
             .args([
                 "-loglevel",
@@ -122,6 +150,7 @@ impl PreviewPlayer {
             .args([
                 "-an", "-vf", &filter, "-pix_fmt", "rgb24", "-f", "rawvideo", "-",
             ])
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -133,8 +162,8 @@ impl PreviewPlayer {
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || read_preview_frames(&mut stdout, sender));
 
-        let audio = if let (Some(stream), Ok(ffplay)) = (audio_stream, which("ffplay")) {
-            let mut audio_command = quiet_command(&ffplay);
+        let audio = if let (Some(stream), Some(ffplay)) = (audio_stream, ffplay) {
+            let mut audio_command = quiet_command(ffplay);
             audio_command
                 .args([
                     "-nodisp",
@@ -173,6 +202,18 @@ impl Drop for PreviewPlayer {
     }
 }
 
+/// Everything derived from probing a file. Built on a worker thread so adding
+/// clips never freezes the UI; the egui-dependent parts are filled in later on
+/// the UI thread.
+struct ClipDraft {
+    path: PathBuf,
+    probe: FfProbe,
+    duration: f64,
+    fps: f64,
+    audio_tracks: Vec<AudioTrack>,
+    preview_audio: Option<i64>,
+}
+
 pub struct TrimmerClip {
     path: PathBuf,
     probe: FfProbe,
@@ -190,7 +231,15 @@ pub struct TrimmerClip {
     size_mb: f64,
     preview: PreviewPlayer,
     preview_texture: Option<TextureHandle>,
-    still_receiver: Option<Receiver<(u64, f64, Vec<u8>)>>,
+    // All pending still decodes report through one long-lived channel so that
+    // several can be in flight at once while the UI thread stays single.
+    still_sender: Sender<(u64, u64, Option<Vec<u8>>)>,
+    still_receiver: Receiver<(u64, u64, Option<Vec<u8>>)>,
+    still_in_flight: usize,
+    // (snapped frame index, rgb bytes) most-recently used; re-seeking to a
+    // frame that was already shown is instant instead of re-decoding.
+    still_cache: Vec<(u64, Vec<u8>)>,
+    still_hit: Option<(u64, Vec<u8>)>,
     pending_still: Option<(Instant, f64)>,
     still_generation: u64,
     thumbnails_receiver: Option<Receiver<Vec<Vec<u8>>>>,
@@ -200,10 +249,13 @@ pub struct TrimmerClip {
     error: Option<String>,
     last_preview_frame: Instant,
     resume_after_seek: bool,
+    ffmpeg: Option<PathBuf>,
+    ffplay: Option<PathBuf>,
 }
 
 impl TrimmerClip {
-    fn load(path: PathBuf) -> Result<Self, String> {
+    /// Probe the file off the UI thread; cheap enough to run anywhere.
+    fn probe(path: PathBuf) -> Result<ClipDraft, String> {
         let probe =
             probe_video(&path).ok_or_else(|| format!("Could not open {}", path.display()))?;
         let duration = probe
@@ -258,24 +310,41 @@ impl TrimmerClip {
             .map(|stream| stream.index)
             .or_else(|| audio_tracks.first().map(|track| track.stream_index));
 
-        let mut clip = Self {
+        Ok(ClipDraft {
             path,
             probe,
             duration,
             fps,
+            audio_tracks,
+            preview_audio,
+        })
+    }
+
+    /// Assemble a clip on the UI thread from a probed draft.
+    fn finish(draft: ClipDraft, ffmpeg: Option<PathBuf>, ffplay: Option<PathBuf>) -> Self {
+        let (still_sender, still_receiver) = mpsc::channel();
+        let mut clip = Self {
+            path: draft.path,
+            probe: draft.probe,
+            duration: draft.duration,
+            fps: draft.fps,
             start: 0.0,
-            end: duration,
+            end: draft.duration,
             playhead: 0.0,
             displayed_position: 0.0,
             start_text: format_time(0.0),
-            end_text: format_time(duration),
-            audio_tracks,
-            preview_audio,
+            end_text: format_time(draft.duration),
+            audio_tracks: draft.audio_tracks,
+            preview_audio: draft.preview_audio,
             size_enabled: false,
             size_mb: 50.0,
             preview: PreviewPlayer::new(),
             preview_texture: None,
-            still_receiver: None,
+            still_sender,
+            still_receiver,
+            still_in_flight: 0,
+            still_cache: Vec::with_capacity(STILL_CACHE_SIZE),
+            still_hit: None,
             pending_still: None,
             still_generation: 0,
             thumbnails_receiver: None,
@@ -285,9 +354,11 @@ impl TrimmerClip {
             error: None,
             last_preview_frame: Instant::now() - Duration::from_millis(34),
             resume_after_seek: false,
+            ffmpeg,
+            ffplay,
         };
         clip.request_still(0.0);
-        Ok(clip)
+        clip
     }
 
     fn frame_duration(&self) -> f64 {
@@ -298,48 +369,76 @@ impl TrimmerClip {
         ((value * self.fps).round() / self.fps).clamp(0.0, self.duration)
     }
 
+    fn frame_index(&self, position: f64) -> u64 {
+        (position.clamp(0.0, self.duration) * self.fps).round() as u64
+    }
+
     fn request_still(&mut self, position: f64) {
-        self.pending_still = Some((
-            Instant::now() + Duration::from_millis(50),
-            position.clamp(0.0, self.duration),
-        ));
+        let position = position.clamp(0.0, self.duration);
+        if let Some((frame, data)) = self
+            .still_cache
+            .iter()
+            .find(|(frame, _)| *frame == self.frame_index(position))
+        {
+            self.pending_still = None;
+            self.still_hit = Some((*frame, data.clone()));
+            return;
+        }
+        self.pending_still = Some((Instant::now() + STILL_DEBOUNCE, position));
     }
 
     fn start_pending_still(&mut self, position: f64) {
         self.still_generation += 1;
         let generation = self.still_generation;
+        let frame = self.frame_index(position);
         let path = self.path.clone();
-        let (sender, receiver) = mpsc::channel();
-        self.still_receiver = Some(receiver);
+        let ffmpeg = self.ffmpeg.clone();
+        let sender = self.still_sender.clone();
+        self.still_in_flight += 1;
         thread::spawn(move || {
-            if let Some(frame) = decode_still(&path, position, PREVIEW_WIDTH, PREVIEW_HEIGHT) {
-                let _ = sender.send((generation, position, frame));
-            }
+            let result = ffmpeg.as_deref().and_then(|ffmpeg| {
+                decode_still(ffmpeg, &path, position, PREVIEW_WIDTH, PREVIEW_HEIGHT)
+            });
+            let _ = sender.send((generation, frame, result));
         });
+    }
+
+    fn cache_still(&mut self, frame: u64, data: Vec<u8>) {
+        if self.still_cache.iter().any(|(f, _)| *f == frame) {
+            return;
+        }
+        if self.still_cache.len() >= STILL_CACHE_SIZE {
+            self.still_cache.remove(0);
+        }
+        self.still_cache.push((frame, data));
     }
 
     fn request_thumbnails(&mut self) {
         self.thumbnails_started = true;
         let path = self.path.clone();
         let duration = self.duration;
+        let ffmpeg = self.ffmpeg.clone();
         let (sender, receiver) = mpsc::channel();
         self.thumbnails_receiver = Some(receiver);
         thread::spawn(move || {
             let path = Arc::new(path);
             let next_index = Arc::new(AtomicUsize::new(0));
             let (frame_sender, frame_receiver) = mpsc::channel();
-            let mut workers = Vec::with_capacity(THUMB_WORKERS);
-            for _ in 0..THUMB_WORKERS {
+            let mut workers = Vec::with_capacity(THUMB_COUNT);
+            for _ in 0..THUMB_COUNT {
                 let path = Arc::clone(&path);
                 let next_index = Arc::clone(&next_index);
                 let frame_sender = frame_sender.clone();
+                let ffmpeg = ffmpeg.clone();
                 workers.push(thread::spawn(move || loop {
                     let index = next_index.fetch_add(1, Ordering::Relaxed);
                     if index >= THUMB_COUNT {
                         break;
                     }
                     let position = duration * (index as f64 + 0.5) / THUMB_COUNT as f64;
-                    let frame = decode_still(&path, position, THUMB_WIDTH, THUMB_HEIGHT);
+                    let frame = ffmpeg.as_deref().and_then(|ffmpeg| {
+                        decode_still(ffmpeg, &path, position, THUMB_WIDTH, THUMB_HEIGHT)
+                    });
                     let _ = frame_sender.send((index, frame));
                 }));
             }
@@ -381,44 +480,58 @@ impl TrimmerClip {
             }
         }
 
-        let mut clear_still_receiver = false;
-        let still = if let Some(receiver) = &self.still_receiver {
-            match receiver.try_recv() {
-                Ok(result) => {
-                    clear_still_receiver = true;
-                    Some(result)
-                }
-                Err(TryRecvError::Disconnected) => {
-                    clear_still_receiver = true;
-                    None
-                }
-                Err(TryRecvError::Empty) => None,
-            }
-        } else {
-            None
-        };
-        if clear_still_receiver {
-            self.still_receiver = None;
-        }
-        if let Some((generation, position, frame)) = still {
-            if generation == self.still_generation
-                && self.pending_still.is_none()
-                && !self.preview.is_playing()
-            {
-                self.displayed_position = self.snap(position);
-                self.set_preview_texture(ctx, clip_index, frame);
+        // A cache hit is applied directly without touching the decoder.
+        if let Some((frame, data)) = self.still_hit.take() {
+            if !self.preview.is_playing() {
+                self.displayed_position = frame as f64 / self.fps;
+                self.set_preview_texture(ctx, clip_index, data);
             }
         }
 
-        if self.still_receiver.is_none() && !self.preview.is_playing() {
-            if let Some((deadline, position)) = self.pending_still {
-                if Instant::now() >= deadline {
-                    self.pending_still = None;
-                    self.start_pending_still(position);
-                } else {
-                    ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+        let mut received = Vec::new();
+        while let Ok(result) = self.still_receiver.try_recv() {
+            received.push(result);
+        }
+        for (generation, frame, data) in received {
+            self.still_in_flight = self.still_in_flight.saturating_sub(1);
+            if self.preview.is_playing() {
+                continue;
+            }
+            if let Some(data) = data {
+                self.cache_still(frame, data.clone());
+                if generation == self.still_generation {
+                    self.displayed_position = frame as f64 / self.fps;
+                    self.set_preview_texture(ctx, clip_index, data);
                 }
             }
+        }
+
+        if !self.preview.is_playing() {
+            if self.still_in_flight < MAX_IN_FLIGHT_STILLS {
+                if let Some((deadline, position)) = self.pending_still {
+                    if Instant::now() >= deadline {
+                        self.pending_still = None;
+                        self.start_pending_still(position);
+                    } else {
+                        ctx.request_repaint_after(
+                            deadline.saturating_duration_since(Instant::now()),
+                        );
+                    }
+                }
+            } else if self.pending_still.is_some() {
+                // All decoders are busy; retry as soon as one frees up.
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+        }
+
+        // Keep the UI awake while decoders are still working so results are
+        // shown the moment they arrive, without needing mouse input.
+        if self.still_in_flight > 0
+            || self.pending_still.is_some()
+            || self.still_hit.is_some()
+            || self.thumbnails_receiver.is_some()
+        {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
 
         let thumbs = self
@@ -472,10 +585,21 @@ impl TrimmerClip {
         if self.playhead >= self.end - self.frame_duration() {
             self.playhead = self.start;
         }
-        self.error = self
-            .preview
-            .start(&self.path, self.playhead, self.end, self.preview_audio)
-            .err();
+        self.error = match self.ffmpeg.as_deref() {
+            Some(ffmpeg) => self
+                .preview
+                .start(PlaybackSettings {
+                    ffmpeg,
+                    ffplay: self.ffplay.as_deref(),
+                    path: &self.path,
+                    position: self.playhead,
+                    end: self.end,
+                    audio_stream: self.preview_audio,
+                    source_fps: self.fps,
+                })
+                .err(),
+            None => Some("FFmpeg was not found in PATH".to_owned()),
+        };
         self.last_preview_frame = Instant::now() - Duration::from_millis(34);
     }
 
@@ -526,26 +650,60 @@ pub struct Trimmer {
     clips: Vec<TrimmerClip>,
     active: usize,
     message: Option<String>,
+    ffmpeg: Option<PathBuf>,
+    ffplay: Option<PathBuf>,
+    loading_receiver: Receiver<(PathBuf, Result<ClipDraft, String>)>,
+    loading_sender: Sender<(PathBuf, Result<ClipDraft, String>)>,
+    pending_loads: usize,
 }
 
 impl Trimmer {
     pub fn new() -> Self {
+        let (loading_sender, loading_receiver) = mpsc::channel();
         Self {
             clips: Vec::new(),
             active: 0,
             message: None,
+            ffmpeg: which("ffmpeg").ok(),
+            ffplay: which("ffplay").ok(),
+            loading_receiver,
+            loading_sender,
+            pending_loads: 0,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clips.is_empty()
+        self.clips.is_empty() && self.pending_loads == 0
     }
 
     pub fn add_paths(&mut self, paths: Vec<PathBuf>) {
         for path in paths {
-            match TrimmerClip::load(path) {
-                Ok(clip) => self.clips.push(clip),
-                Err(error) => self.message = Some(error),
+            self.pending_loads += 1;
+            let sender = self.loading_sender.clone();
+            thread::spawn(move || {
+                let _ = sender.send((path.clone(), TrimmerClip::probe(path)));
+            });
+        }
+    }
+
+    /// Collects clips whose probing finished since the last frame.
+    fn poll_loading(&mut self) {
+        loop {
+            match self.loading_receiver.try_recv() {
+                Ok((_path, Ok(draft))) => {
+                    self.pending_loads = self.pending_loads.saturating_sub(1);
+                    let clip = TrimmerClip::finish(draft, self.ffmpeg.clone(), self.ffplay.clone());
+                    self.clips.push(clip);
+                }
+                Ok((path, Err(error))) => {
+                    self.pending_loads = self.pending_loads.saturating_sub(1);
+                    self.message = Some(format!("{}: {error}", path.display()));
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.pending_loads = 0;
+                    break;
+                }
             }
         }
         self.active = self.active.min(self.clips.len().saturating_sub(1));
@@ -558,7 +716,14 @@ impl Trimmer {
     }
 
     pub fn ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) -> Option<TrimmerAction> {
+        self.poll_loading();
         if self.clips.is_empty() {
+            if self.pending_loads > 0 {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Probing clips…");
+                });
+            }
             return None;
         }
 
@@ -735,7 +900,7 @@ impl Trimmer {
                 clip.playhead = clip.preview.stop().clamp(clip.start, clip.end);
                 clip.start_playback();
             }
-            if which("ffplay").is_err() {
+            if self.ffplay.is_none() {
                 columns[0]
                     .colored_label(Color32::YELLOW, "FFplay not found: audio preview is muted");
             }
@@ -918,12 +1083,17 @@ fn read_preview_frames(stdout: &mut impl Read, sender: SyncSender<(u64, Vec<u8>)
     }
 }
 
-fn decode_still(path: &Path, position: f64, width: usize, height: usize) -> Option<Vec<u8>> {
-    let ffmpeg = which("ffmpeg").ok()?;
+fn decode_still(
+    ffmpeg: &Path,
+    path: &Path,
+    position: f64,
+    width: usize,
+    height: usize,
+) -> Option<Vec<u8>> {
     let filter = format!(
         "scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
     );
-    let output = quiet_command(&ffmpeg)
+    let output = quiet_command(ffmpeg)
         .args(["-loglevel", "error", "-ss", &format_seconds(position), "-i"])
         .arg(path)
         .args([
@@ -998,7 +1168,9 @@ fn parse_time(value: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_time, parse_rational, parse_time};
+    use super::{decode_still, format_time, parse_rational, parse_time};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn time_round_trip() {
@@ -1011,5 +1183,44 @@ mod tests {
     fn rational_fps() {
         assert!((parse_rational("60000/1001").unwrap() - 59.94005994).abs() < 0.0001);
         assert_eq!(parse_rational("30"), Some(30.0));
+    }
+
+    #[test]
+    fn still_decodes_letterboxed_preview_frame() {
+        let Ok(ffmpeg) = which::which("ffmpeg") else {
+            return;
+        };
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let source = std::env::temp_dir().join(format!("smoothie-still-test-{nonce}.mp4"));
+        let generated = Command::new(&ffmpeg)
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=1920x1080:rate=30:duration=2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(generated.success());
+
+        let frame = decode_still(&ffmpeg, &source, 1.0, 768, 432);
+        assert!(frame.is_some(), "still decode failed");
+        assert_eq!(frame.unwrap().len(), 768 * 432 * 3);
+
+        // Positions past the end of the clip yield no frame.
+        assert!(decode_still(&ffmpeg, &source, 60.0, 768, 432).is_none());
+
+        let _ = std::fs::remove_file(&source);
     }
 }

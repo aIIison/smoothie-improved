@@ -13,7 +13,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SmCommand {
     pub vs_path: String,
