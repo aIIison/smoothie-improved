@@ -12,6 +12,7 @@ use std::{
     io::Write,
     path::PathBuf,
     sync::mpsc::Sender, // used to retrieve SmCommands
+    time::{Duration, Instant},
 };
 #[cfg(windows)]
 use winit::raw_window_handle::HasWindowHandle;
@@ -41,6 +42,10 @@ struct SmApp {
     sender: Sender<(Recipe, Arguments, Vec<GuiClipJob>, WinHWND)>,
     make_new_recipe: bool,
     new_recipe_filename: String,
+    // Listing the config folder per frame while the recipe combo is open is
+    // wasteful; refresh it at most every couple of seconds instead.
+    config_filepaths: Vec<PathBuf>,
+    config_filepaths_refreshed: Instant,
 }
 
 pub const WINDOW_NAME: &str = "smoothie-app";
@@ -131,6 +136,8 @@ pub fn sm_gui<'gui>(
                 sender,
                 make_new_recipe: false,
                 new_recipe_filename: String::new(),
+                config_filepaths: crate::portable::get_config_filepaths(),
+                config_filepaths_refreshed: Instant::now(),
             }))
         }),
     )
@@ -306,7 +313,11 @@ impl eframe::App for SmApp {
             egui::ComboBox::from_label("")
                 .selected_text(selected_recipe)
                 .show_ui(ui, |ui| {
-                    let enum_values = crate::portable::get_config_filepaths();
+                    if self.config_filepaths_refreshed.elapsed() >= Duration::from_secs(2) {
+                        self.config_filepaths = crate::portable::get_config_filepaths();
+                        self.config_filepaths_refreshed = Instant::now();
+                    }
+                    let enum_values = self.config_filepaths.clone();
                     for enum_value in enum_values {
 
                         let selected_value = enum_value.to_str().unwrap().to_string();
